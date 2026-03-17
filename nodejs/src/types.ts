@@ -844,6 +844,15 @@ export interface SessionConfig {
      * but executes earlier in the lifecycle so no events are missed.
      */
     onEvent?: SessionEventHandler;
+
+    /**
+     * Session event store callbacks. When provided, the client handles all
+     * event persistence instead of the server's default file-based storage.
+     *
+     * The server calls back into these callbacks over RPC whenever it needs
+     * to load, append, truncate, list, or delete session events.
+     */
+    sessionStore?: SessionStoreConfig;
 }
 
 /**
@@ -872,6 +881,7 @@ export type ResumeSessionConfig = Pick<
     | "disabledSkills"
     | "infiniteSessions"
     | "onEvent"
+    | "sessionStore"
 > & {
     /**
      * When true, skips emitting the session.resume event.
@@ -1005,6 +1015,51 @@ export interface SessionContext {
     repository?: string;
     /** Current git branch */
     branch?: string;
+}
+
+/**
+ * Callbacks for a session event store. When provided to {@link SessionConfig.sessionStore},
+ * the server routes all event persistence through these callbacks over RPC instead
+ * of using its default file-based storage.
+ */
+export interface SessionStoreConfig {
+    /**
+     * Opaque descriptor identifying this storage backend.
+     * Used for UI display (e.g., `"redis://localhost/sessions"`) and to verify
+     * resume-consistency — two stores are considered equivalent if and only if
+     * their descriptors are identical strings.
+     */
+    descriptor: string;
+
+    /** Load all events for a session. Return an empty array if the session doesn't exist. */
+    onLoad: (sessionId: string) => Promise<SessionEvent[]>;
+
+    /** Append events to a session's event log. */
+    onAppend: (events: SessionEvent[], sessionId: string) => Promise<void>;
+
+    /** Truncate events up to (and including) the given event ID. */
+    onTruncate: (
+        upToEventId: string,
+        sessionId: string,
+    ) => Promise<{ eventsRemoved: number; eventsKept: number }>;
+
+    /** List all sessions in this store. */
+    onListSessions: () => Promise<
+        Array<{ sessionId: string; mtime: string; birthtime: string }>
+    >;
+
+    /** Delete a session from this store. */
+    onDelete: (sessionId: string) => Promise<void>;
+}
+
+/**
+ * Options for listing sessions, optionally with a session store.
+ */
+export interface ListSessionsOptions {
+    /** Filter to narrow down which sessions to return. */
+    filter?: SessionListFilter;
+    /** When provided, list sessions from this store instead of the server's default. */
+    sessionStore?: SessionStoreConfig;
 }
 
 /**

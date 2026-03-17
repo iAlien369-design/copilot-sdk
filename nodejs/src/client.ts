@@ -33,6 +33,7 @@ import type {
     ForegroundSessionInfo,
     GetAuthStatusResponse,
     GetStatusResponse,
+    ListSessionsOptions,
     ModelInfo,
     ResumeSessionConfig,
     SessionConfig,
@@ -43,6 +44,7 @@ import type {
     SessionLifecycleHandler,
     SessionListFilter,
     SessionMetadata,
+    SessionStoreConfig,
     TelemetryConfig,
     Tool,
     ToolCallRequestPayload,
@@ -175,6 +177,10 @@ export class CopilotClient {
     private _rpc: ReturnType<typeof createServerRpc> | null = null;
     private processExitPromise: Promise<never> | null = null; // Rejects when CLI process exits
     private negotiatedProtocolVersion: number | null = null;
+    /** Per-session store configs, keyed by sessionId. Used to route sessionStore.* RPC requests. */
+    private sessionStoreConfigs: Map<string, SessionStoreConfig> = new Map();
+    /** Temporary store used during listSessions() calls with a session store. */
+    private listSessionsStore: SessionStoreConfig | null = null;
 
     /**
      * Typed server-scoped RPC methods.
@@ -588,6 +594,12 @@ export class CopilotClient {
         }
         this.sessions.set(sessionId, session);
 
+        // Register session store callbacks before the RPC so that
+        // store requests arriving during session creation are handled.
+        if (config.sessionStore) {
+            this.sessionStoreConfigs.set(sessionId, config.sessionStore);
+        }
+
         try {
             const response = await this.connection!.sendRequest("session.create", {
                 ...(await getTraceContext(this.onGetTraceContext)),
@@ -619,6 +631,9 @@ export class CopilotClient {
                 skillDirectories: config.skillDirectories,
                 disabledSkills: config.disabledSkills,
                 infiniteSessions: config.infiniteSessions,
+                sessionStore: config.sessionStore
+                    ? { descriptor: config.sessionStore.descriptor }
+                    : undefined,
             });
 
             const { workspacePath } = response as {
@@ -628,6 +643,7 @@ export class CopilotClient {
             session["_workspacePath"] = workspacePath;
         } catch (e) {
             this.sessions.delete(sessionId);
+            this.sessionStoreConfigs.delete(sessionId);
             throw e;
         }
 
@@ -694,6 +710,11 @@ export class CopilotClient {
         }
         this.sessions.set(sessionId, session);
 
+        // Register session store callbacks before the RPC
+        if (config.sessionStore) {
+            this.sessionStoreConfigs.set(sessionId, config.sessionStore);
+        }
+
         try {
             const response = await this.connection!.sendRequest("session.resume", {
                 ...(await getTraceContext(this.onGetTraceContext)),
@@ -726,6 +747,9 @@ export class CopilotClient {
                 disabledSkills: config.disabledSkills,
                 infiniteSessions: config.infiniteSessions,
                 disableResume: config.disableResume,
+                sessionStore: config.sessionStore
+                    ? { descriptor: config.sessionStore.descriptor }
+                    : undefined,
             });
 
             const { workspacePath } = response as {
@@ -735,6 +759,7 @@ export class CopilotClient {
             session["_workspacePath"] = workspacePath;
         } catch (e) {
             this.sessions.delete(sessionId);
+            this.sessionStoreConfigs.delete(sessionId);
             throw e;
         }
 
@@ -951,6 +976,7 @@ export class CopilotClient {
 
         // Remove from local sessions map if present
         this.sessions.delete(sessionId);
+        this.sessionStoreConfigs.delete(sessionId);
     }
 
     /**
@@ -966,31 +992,55 @@ export class CopilotClient {
      * // List sessions for a specific repository
      * const sessions = await client.listSessions({ repository: "owner/repo" });
      */
-    async listSessions(filter?: SessionListFilter): Promise<SessionMetadata[]> {
+    async listSessions(filterOrOptions?: SessionListFilter | ListSessionsOptions): Promise<SessionMetadata[]> {
         if (!this.connection) {
             throw new Error("Client not connected");
         }
 
-        const response = await this.connection.sendRequest("session.list", { filter });
-        const { sessions } = response as {
-            sessions: Array<{
-                sessionId: string;
-                startTime: string;
-                modifiedTime: string;
-                summary?: string;
-                isRemote: boolean;
-                context?: SessionContext;
-            }>;
-        };
+        // Support both plain filter and full options object
+        const options: ListSessionsOptions | undefined =
+            filterOrOptions && "sessionStore" in filterOrOptions
+                ? (filterOrOptions as ListSessionsOptions)
+                : filterOrOptions
+                  ? { filter: filterOrOptions as SessionListFilter }
+                  : undefined;
 
-        return sessions.map((s) => ({
-            sessionId: s.sessionId,
-            startTime: new Date(s.startTime),
-            modifiedTime: new Date(s.modifiedTime),
-            summary: s.summary,
-            isRemote: s.isRemote,
-            context: s.context,
-        }));
+        // Temporarily register the store for the duration of this RPC call
+        if (options?.sessionStore) {
+            this.listSessionsStore = options.sessionStore;
+        }
+
+        try {
+            const response = await this.connection.sendRequest("session.list", {
+                filter: options?.filter,
+                sessionStore: options?.sessionStore
+                    ? { descriptor: options.sessionStore.descriptor }
+                    : undefined,
+            });
+            const { sessions } = response as {
+                sessions: Array<{
+                    sessionId: string;
+                    startTime: string;
+                    modifiedTime: string;
+                    summary?: string;
+                    isRemote: boolean;
+                    context?: SessionContext;
+                }>;
+            };
+
+            return sessions.map((s) => ({
+                sessionId: s.sessionId,
+                startTime: new Date(s.startTime),
+                modifiedTime: new Date(s.modifiedTime),
+                summary: s.summary,
+                isRemote: s.isRemote,
+                context: s.context,
+            }));
+        } finally {
+            if (options?.sessionStore) {
+                this.listSessionsStore = null;
+            }
+        }
     }
 
     /**
@@ -1453,6 +1503,71 @@ export class CopilotClient {
                 hookType: string;
                 input: unknown;
             }): Promise<{ output?: unknown }> => await this.handleHooksInvoke(params)
+        );
+
+        // Register session store RPC handlers (server→client callbacks for event persistence)
+        this.connection.onRequest(
+            "sessionStore.load",
+            async (params: { sessionId: string }): Promise<{ events: SessionEvent[] }> => {
+                const store = this.sessionStoreConfigs.get(params.sessionId);
+                if (!store) {
+                    throw new Error(`No session store registered for session ${params.sessionId}`);
+                }
+                const events = await store.onLoad(params.sessionId);
+                return { events };
+            }
+        );
+
+        this.connection.onRequest(
+            "sessionStore.append",
+            async (params: { sessionId: string; events: SessionEvent[] }): Promise<void> => {
+                const store = this.sessionStoreConfigs.get(params.sessionId);
+                if (!store) {
+                    throw new Error(`No session store registered for session ${params.sessionId}`);
+                }
+                await store.onAppend(params.events, params.sessionId);
+            }
+        );
+
+        this.connection.onRequest(
+            "sessionStore.truncate",
+            async (params: {
+                sessionId: string;
+                upToEventId: string;
+            }): Promise<{ eventsRemoved: number; eventsKept: number }> => {
+                const store = this.sessionStoreConfigs.get(params.sessionId);
+                if (!store) {
+                    throw new Error(`No session store registered for session ${params.sessionId}`);
+                }
+                return await store.onTruncate(params.upToEventId, params.sessionId);
+            }
+        );
+
+        this.connection.onRequest(
+            "sessionStore.list",
+            async (): Promise<{
+                sessions: Array<{ sessionId: string; mtime: string; birthtime: string }>;
+            }> => {
+                // Use the most recently registered store for listing.
+                // In practice, listSessions() registers a temporary store before the RPC call.
+                const store = this.listSessionsStore;
+                if (!store) {
+                    throw new Error("No session store registered for listing");
+                }
+                const sessions = await store.onListSessions();
+                return { sessions };
+            }
+        );
+
+        this.connection.onRequest(
+            "sessionStore.delete",
+            async (params: { sessionId: string }): Promise<void> => {
+                const store = this.sessionStoreConfigs.get(params.sessionId);
+                if (!store) {
+                    throw new Error(`No session store registered for session ${params.sessionId}`);
+                }
+                await store.onDelete(params.sessionId);
+            }
         );
 
         this.connection.onClose(() => {
